@@ -217,9 +217,15 @@ class AgentLoop:
             # Build on_token callback for streaming
             on_token = None
             if streaming and on_progress:
-                async def _token_callback(token: str) -> None:
-                    await on_progress(token)
+                logger.info("[STREAMING] Enabled with progress callback")
+                def _token_callback(token: str) -> None:
+                    # Use call_soon for immediate scheduling instead of create_task
+                    # This reduces latency for first token
+                    loop = asyncio.get_event_loop()
+                    loop.call_soon(lambda: asyncio.create_task(on_progress(token)))
                 on_token = _token_callback
+            else:
+                logger.debug("[STREAMING] Disabled: streaming={}, on_progress={}", streaming, on_progress is not None)
 
             response = await self.provider.chat(
                 messages=messages,

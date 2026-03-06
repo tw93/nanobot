@@ -4,6 +4,8 @@ import json
 import subprocess
 from typing import Any
 
+from loguru import logger
+
 from nanobot.agent.tools.base import Tool
 
 

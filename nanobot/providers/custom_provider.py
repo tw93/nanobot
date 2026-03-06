@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Callable
 
 import json_repair
+from loguru import logger
 from openai import AsyncOpenAI
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -69,7 +70,9 @@ class CustomProvider(LLMProvider):
             # Handle content delta
             if delta.content:
                 full_content += delta.content
-                on_token(delta.content)
+                if on_token:
+                    logger.info("[STREAM] Token: {}...", delta.content[:20])
+                    on_token(delta.content)
 
             # Handle reasoning content (for models that support it)
             if hasattr(delta, "reasoning_content") and delta.reasoning_content:

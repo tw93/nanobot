@@ -215,6 +215,7 @@ class TelegramChannel(BaseChannel):
                 "lock": asyncio.Lock(),
                 "last_update": 0,
                 "update_task": None,
+                "first_token": True,  # Track first token for immediate send
             }
 
         buffer = self._streaming_buffers[buffer_key]
@@ -222,24 +223,31 @@ class TelegramChannel(BaseChannel):
         async with buffer["lock"]:
             buffer["content"] += content
 
-            # Throttle updates: at most every 0.3 seconds
+            # First token sends immediately, then throttle to 0.2s
             now = asyncio.get_event_loop().time()
-            if now - buffer["last_update"] < 0.3:
+            is_first = buffer["first_token"]
+            if is_first:
+                buffer["first_token"] = False
+                buffer["last_update"] = now
+                # Cancel any pending delayed update
+                if buffer["update_task"] and not buffer["update_task"].done():
+                    buffer["update_task"].cancel()
+            elif now - buffer["last_update"] < 0.2:
                 # Schedule update if not already scheduled
                 if buffer["update_task"] is None or buffer["update_task"].done():
                     buffer["update_task"] = asyncio.create_task(
                         self._delayed_streaming_update(buffer_key, chat_id, draft_id)
                     )
                 return
-
-            buffer["last_update"] = now
+            else:
+                buffer["last_update"] = now
 
         # Send update immediately
         await self._send_streaming_update(buffer_key, chat_id, draft_id)
 
     async def _delayed_streaming_update(self, buffer_key: str, chat_id: int, draft_id: int) -> None:
         """Send a delayed update after throttle period."""
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)  # Reduced from 0.3 to 0.2
         await self._send_streaming_update(buffer_key, chat_id, draft_id)
 
     async def _send_streaming_update(self, buffer_key: str, chat_id: int, draft_id: int) -> None:
