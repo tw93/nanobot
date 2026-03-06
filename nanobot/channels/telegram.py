@@ -113,6 +113,8 @@ class TelegramChannel(BaseChannel):
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
+        # Streaming message buffers: draft_id -> {"content": str, "lock": asyncio.Lock, "task": asyncio.Task}
+        self._streaming_buffers: dict[str, dict] = {}
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -202,6 +204,80 @@ class TelegramChannel(BaseChannel):
             return "audio"
         return "document"
 
+    async def _handle_streaming_message(self, chat_id: int, draft_id: int, content: str) -> None:
+        """Handle streaming message with buffering and throttling."""
+        buffer_key = f"{chat_id}:{draft_id}"
+
+        # Initialize buffer if needed
+        if buffer_key not in self._streaming_buffers:
+            self._streaming_buffers[buffer_key] = {
+                "content": "",
+                "lock": asyncio.Lock(),
+                "last_update": 0,
+                "update_task": None,
+            }
+
+        buffer = self._streaming_buffers[buffer_key]
+
+        async with buffer["lock"]:
+            buffer["content"] += content
+
+            # Throttle updates: at most every 0.3 seconds
+            now = asyncio.get_event_loop().time()
+            if now - buffer["last_update"] < 0.3:
+                # Schedule update if not already scheduled
+                if buffer["update_task"] is None or buffer["update_task"].done():
+                    buffer["update_task"] = asyncio.create_task(
+                        self._delayed_streaming_update(buffer_key, chat_id, draft_id)
+                    )
+                return
+
+            buffer["last_update"] = now
+
+        # Send update immediately
+        await self._send_streaming_update(buffer_key, chat_id, draft_id)
+
+    async def _delayed_streaming_update(self, buffer_key: str, chat_id: int, draft_id: int) -> None:
+        """Send a delayed update after throttle period."""
+        await asyncio.sleep(0.3)
+        await self._send_streaming_update(buffer_key, chat_id, draft_id)
+
+    async def _send_streaming_update(self, buffer_key: str, chat_id: int, draft_id: int) -> None:
+        """Send the current buffer content as a draft update."""
+        if buffer_key not in self._streaming_buffers:
+            return
+
+        buffer = self._streaming_buffers[buffer_key]
+        async with buffer["lock"]:
+            content = buffer["content"]
+            buffer["last_update"] = asyncio.get_event_loop().time()
+
+        if not content or not self._app:
+            return
+
+        try:
+            # Truncate if too long for Telegram
+            display_content = content[:TELEGRAM_MAX_MESSAGE_LEN]
+            html = _markdown_to_telegram_html(display_content)
+            await self._app.bot.send_message_draft(
+                chat_id=chat_id,
+                draft_id=draft_id,
+                text=html + "▌",  # Cursor indicator for streaming
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.debug("Streaming update failed (draft may be finalized): {}", e)
+            # Clean up buffer on error
+            self._streaming_buffers.pop(buffer_key, None)
+
+    def _cleanup_streaming_buffer(self, buffer_key: str) -> None:
+        """Clean up streaming buffer for a message."""
+        if buffer_key in self._streaming_buffers:
+            buffer = self._streaming_buffers[buffer_key]
+            if buffer.get("update_task") and not buffer["update_task"].done():
+                buffer["update_task"].cancel()
+            self._streaming_buffers.pop(buffer_key, None)
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
         if not self._app:
@@ -211,6 +287,15 @@ class TelegramChannel(BaseChannel):
         # Only stop typing indicator for final responses
         if not msg.metadata.get("_progress", False):
             self._stop_typing(msg.chat_id)
+            # Clean up any streaming buffers for this message
+            try:
+                chat_id_int = int(msg.chat_id)
+                draft_id = msg.metadata.get("message_id")
+                if draft_id:
+                    buffer_key = f"{chat_id_int}:{draft_id}"
+                    self._cleanup_streaming_buffer(buffer_key)
+            except (ValueError, TypeError):
+                pass
 
         try:
             chat_id = int(msg.chat_id)
@@ -257,38 +342,29 @@ class TelegramChannel(BaseChannel):
             is_progress = msg.metadata.get("_progress", False)
             draft_id = msg.metadata.get("message_id")
 
+            # Handle streaming progress messages with buffering
+            if is_progress and draft_id:
+                await self._handle_streaming_message(chat_id, draft_id, msg.content)
+                return
+
+            # Regular (non-streaming) message sending
             for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
                 try:
                     html = _markdown_to_telegram_html(chunk)
-                    if is_progress and draft_id:
-                        await self._app.bot.send_message_draft(
-                            chat_id=chat_id,
-                            draft_id=draft_id,
-                            text=html,
-                            parse_mode="HTML"
-                        )
-                    else:
-                        await self._app.bot.send_message(
-                            chat_id=chat_id,
-                            text=html,
-                            parse_mode="HTML",
-                            reply_parameters=reply_params
-                        )
+                    await self._app.bot.send_message(
+                        chat_id=chat_id,
+                        text=html,
+                        parse_mode="HTML",
+                        reply_parameters=reply_params
+                    )
                 except Exception as e:
                     logger.warning("HTML parse failed, falling back to plain text: {}", e)
                     try:
-                        if is_progress and draft_id:
-                            await self._app.bot.send_message_draft(
-                                chat_id=chat_id,
-                                draft_id=draft_id,
-                                text=chunk
-                            )
-                        else:
-                            await self._app.bot.send_message(
-                                chat_id=chat_id,
-                                text=chunk,
-                                reply_parameters=reply_params
-                            )
+                        await self._app.bot.send_message(
+                            chat_id=chat_id,
+                            text=chunk,
+                            reply_parameters=reply_params
+                        )
                     except Exception as e2:
                         logger.error("Error sending Telegram message: {}", e2)
 

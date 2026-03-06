@@ -22,6 +22,8 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools.defuddle import DefuddleTool
+from nanobot.agent.tools.agent_reach import YouTubeTool, RSSFeedTool, TwitterTool, GitHubRepoTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
@@ -67,6 +69,7 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        streaming: bool = True,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -86,6 +89,7 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.streaming = streaming
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -141,6 +145,13 @@ class AgentLoop:
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
+        # Register Agent Reach tools
+        self.tools.register(DefuddleTool())
+        self.tools.register(YouTubeTool())
+        self.tools.register(RSSFeedTool())
+        self.tools.register(TwitterTool())
+        self.tools.register(GitHubRepoTool())
+
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
         if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
@@ -192,6 +203,7 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        streaming: bool = False,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
@@ -202,6 +214,13 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
+            # Build on_token callback for streaming
+            on_token = None
+            if streaming and on_progress:
+                async def _token_callback(token: str) -> None:
+                    await on_progress(token)
+                on_token = _token_callback
+
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
@@ -209,6 +228,7 @@ class AgentLoop:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
+                on_token=on_token,
             )
 
             if response.has_tool_calls:
@@ -453,7 +473,7 @@ class AgentLoop:
             ))
 
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages, on_progress=on_progress or _bus_progress, streaming=self.streaming,
         )
 
         if final_content is None:
