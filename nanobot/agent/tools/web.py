@@ -45,7 +45,7 @@ def _validate_url(url: str) -> tuple[bool, str]:
 
 
 class WebSearchTool(Tool):
-    """Search the web using Brave Search API."""
+    """Search the web using Brave Search API or xAI Grok Search."""
 
     name = "web_search"
     description = "Search the web. Returns titles, URLs, and snippets."
@@ -58,17 +58,25 @@ class WebSearchTool(Tool):
         "required": ["query"]
     }
 
-    def __init__(self, api_key: str | None = None, max_results: int = 5, proxy: str | None = None):
+    def __init__(self, api_key: str | None = None, max_results: int = 5, proxy: str | None = None, provider: str = "brave", xai_api_key: str | None = None):
         self._init_api_key = api_key
         self.max_results = max_results
         self.proxy = proxy
+        self.provider = provider
+        self._xai_api_key = xai_api_key
 
     @property
     def api_key(self) -> str:
         """Resolve API key at call time so env/config changes are picked up."""
         return self._init_api_key or os.environ.get("BRAVE_API_KEY", "")
 
-    async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
+    @property
+    def xai_api_key(self) -> str:
+        """Resolve xAI API key at call time."""
+        return self._xai_api_key or os.environ.get("XAI_API_KEY", "")
+
+    async def _search_brave(self, query: str, count: int) -> str:
+        """Search using Brave Search API."""
         if not self.api_key:
             return (
                 "Error: Brave Search API key not configured. Set it in "
@@ -76,28 +84,90 @@ class WebSearchTool(Tool):
                 "(or export BRAVE_API_KEY), then restart the gateway."
             )
 
+        async with httpx.AsyncClient(proxy=self.proxy) as client:
+            r = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": count},
+                headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
+                timeout=10.0
+            )
+            r.raise_for_status()
+
+        results = r.json().get("web", {}).get("results", [])[:count]
+        if not results:
+            return f"No results for: {query}"
+
+        lines = [f"Results for: {query}\n"]
+        for i, item in enumerate(results, 1):
+            lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
+            if desc := item.get("description"):
+                lines.append(f"   {desc}")
+        return "\n".join(lines)
+
+    async def _search_xai(self, query: str, count: int) -> str:
+        """Search using xAI Grok with web search tool."""
+        if not self.xai_api_key:
+            return (
+                "Error: xAI API key not configured. Set it in "
+                "~/.nanobot/config.json under tools.web.search.xaiApiKey "
+                "(or export XAI_API_KEY), then restart the gateway."
+            )
+
+        async with httpx.AsyncClient(proxy=self.proxy) as client:
+            r = await client.post(
+                "https://api.x.ai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.xai_api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "grok-2-latest",
+                    "messages": [{"role": "user", "content": query}],
+                    "tools": [{"type": "web_search", "function": {}}],
+                    "tool_choice": "auto"
+                },
+                timeout=30.0
+            )
+            r.raise_for_status()
+            data = r.json()
+
+        # Extract search results from the response
+        message = data.get("choices", [{}])[0].get("message", {})
+        content = message.get("content", "")
+        tool_calls = message.get("tool_calls", [])
+
+        lines = [f"Results for: {query}\n"]
+
+        # If there are tool calls with search results, format them
+        for tool_call in tool_calls:
+            if tool_call.get("type") == "web_search":
+                function_args = tool_call.get("function", {}).get("arguments", "{}")
+                try:
+                    args = json.loads(function_args)
+                    results = args.get("results", [])
+                    for i, item in enumerate(results[:count], 1):
+                        lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
+                        if desc := item.get("snippet", item.get("description", "")):
+                            lines.append(f"   {desc}")
+                except json.JSONDecodeError:
+                    pass
+
+        # Add the model's response content
+        if content:
+            lines.append(f"\nGrok's summary:\n{content}")
+
+        return "\n".join(lines) if len(lines) > 1 else f"No search results for: {query}"
+
+    async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
         try:
             n = min(max(count or self.max_results, 1), 10)
-            logger.debug("WebSearch: {}", "proxy enabled" if self.proxy else "direct connection")
-            async with httpx.AsyncClient(proxy=self.proxy) as client:
-                r = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": n},
-                    headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
-                    timeout=10.0
-                )
-                r.raise_for_status()
+            logger.debug("WebSearch: {} via {}", "proxy enabled" if self.proxy else "direct connection", self.provider)
 
-            results = r.json().get("web", {}).get("results", [])[:n]
-            if not results:
-                return f"No results for: {query}"
+            if self.provider == "xai":
+                return await self._search_xai(query, n)
+            else:
+                return await self._search_brave(query, n)
 
-            lines = [f"Results for: {query}\n"]
-            for i, item in enumerate(results, 1):
-                lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
-                if desc := item.get("description"):
-                    lines.append(f"   {desc}")
-            return "\n".join(lines)
         except httpx.ProxyError as e:
             logger.error("WebSearch proxy error: {}", e)
             return f"Proxy error: {e}"

@@ -288,6 +288,8 @@ class WebSearchConfig(Base):
     """Web search tool configuration."""
 
     api_key: str = ""  # Brave Search API key
+    xai_api_key: str = ""  # xAI API key for Grok search
+    provider: str = "brave"  # Search provider: "brave" or "xai"
     max_results: int = 5
 
 

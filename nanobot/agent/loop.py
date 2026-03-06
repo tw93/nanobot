@@ -59,6 +59,8 @@ class AgentLoop:
         reasoning_effort: str | None = None,
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
+        xai_api_key: str | None = None,
+        search_provider: str = "brave",
         exec_config: ExecToolConfig | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
@@ -79,6 +81,8 @@ class AgentLoop:
         self.reasoning_effort = reasoning_effort
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
+        self.xai_api_key = xai_api_key
+        self.search_provider = search_provider
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
@@ -96,6 +100,8 @@ class AgentLoop:
             reasoning_effort=reasoning_effort,
             brave_api_key=brave_api_key,
             web_proxy=web_proxy,
+            xai_api_key=xai_api_key,
+            search_provider=search_provider,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
         )
@@ -123,7 +129,12 @@ class AgentLoop:
             restrict_to_workspace=self.restrict_to_workspace,
             path_append=self.exec_config.path_append,
         ))
-        self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
+        self.tools.register(WebSearchTool(
+            api_key=self.brave_api_key,
+            proxy=self.web_proxy,
+            provider=self.search_provider,
+            xai_api_key=self.xai_api_key,
+        ))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
