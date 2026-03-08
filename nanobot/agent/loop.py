@@ -70,6 +70,7 @@ class AgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         streaming: bool = True,
+        enabled_tools: list[str] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -90,6 +91,7 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self.streaming = streaming
+        self.enabled_tools = enabled_tools
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -125,32 +127,63 @@ class AgentLoop:
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
-        for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
-            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
-        self.tools.register(ExecTool(
-            working_dir=str(self.workspace),
-            timeout=self.exec_config.timeout,
-            restrict_to_workspace=self.restrict_to_workspace,
-            path_append=self.exec_config.path_append,
-        ))
-        self.tools.register(WebSearchTool(
-            api_key=self.brave_api_key,
-            proxy=self.web_proxy,
-            provider=self.search_provider,
-            xai_api_key=self.xai_api_key,
-        ))
-        self.tools.register(WebFetchTool(proxy=self.web_proxy))
+        enabled = self.enabled_tools
+
+        # Helper to check if tool is enabled
+        def is_enabled(name: str) -> bool:
+            if enabled is None:
+                return True
+            return name in enabled
+
+        # Filesystem tools (编程助手必备)
+        if is_enabled("filesystem"):
+            for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
+                self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+
+        # Shell execution
+        if is_enabled("exec"):
+            self.tools.register(ExecTool(
+                working_dir=str(self.workspace),
+                timeout=self.exec_config.timeout,
+                restrict_to_workspace=self.restrict_to_workspace,
+                path_append=self.exec_config.path_append,
+            ))
+
+        # Web search
+        if is_enabled("web_search"):
+            self.tools.register(WebSearchTool(
+                api_key=self.brave_api_key,
+                proxy=self.web_proxy,
+                provider=self.search_provider,
+                xai_api_key=self.xai_api_key,
+            ))
+
+        # Web fetch
+        if is_enabled("web_fetch"):
+            self.tools.register(WebFetchTool(proxy=self.web_proxy))
+
+        # Always register message tool (needed for communication)
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
-        self.tools.register(SpawnTool(manager=self.subagents))
-        if self.cron_service:
+
+        # Subagent
+        if is_enabled("spawn"):
+            self.tools.register(SpawnTool(manager=self.subagents))
+
+        # Cron
+        if is_enabled("cron") and self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
-        # Register Agent Reach tools
-        self.tools.register(DefuddleTool())
-        self.tools.register(YouTubeTool())
-        self.tools.register(RSSFeedTool())
-        self.tools.register(TwitterTool())
-        self.tools.register(GitHubRepoTool())
+        # Agent Reach tools
+        if is_enabled("defuddle"):
+            self.tools.register(DefuddleTool())
+        if is_enabled("youtube"):
+            self.tools.register(YouTubeTool())
+        if is_enabled("rss"):
+            self.tools.register(RSSFeedTool())
+        if is_enabled("twitter"):
+            self.tools.register(TwitterTool())
+        if is_enabled("github"):
+            self.tools.register(GitHubRepoTool())
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""

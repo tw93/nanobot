@@ -312,6 +312,7 @@ def gateway(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         streaming=config.agents.defaults.streaming,
+        enabled_tools=config.tools.enabled_tools if hasattr(config.tools, 'enabled_tools') else None,
     )
 
     # Set cron callback (needs agent)
